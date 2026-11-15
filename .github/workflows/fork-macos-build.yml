@@ -1,0 +1,110 @@
+name: Fork · macOS dark-icon build
+
+on:
+  schedule:
+    # Scheduled workflows are disabled on forks until enabled once, and after 60 days without activity.
+    - cron: '17 3 * * *'
+  workflow_dispatch:
+    inputs:
+      source_tag:
+        description: 'dsh-v* tag to build (empty: newest upstream release tag)'
+        type: string
+        required: false
+        default: ''
+
+permissions:
+  contents: write
+
+concurrency:
+  group: fork-macos-build
+  cancel-in-progress: false
+
+jobs:
+  build:
+    # macos-26 is Apple Silicon and ships Xcode 26, whose actool compiles Icon Composer documents.
+    runs-on: macos-26
+    timeout-minutes: 240
+    env:
+      DSH_TELEMETRY_DISABLED: '1'
+      NOTIFY_WEBHOOK: ${{ secrets.NOTIFY_WEBHOOK }}
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          fetch-depth: 0
+
+      - name: Merge newest upstream release
+        run: |
+          set -euo pipefail
+          git config user.name 'fork-build'
+          git config user.email 'fork-build@users.noreply.github.com'
+          git remote add upstream https://github.com/deepseek-ai/deepseek-harness.git
+          git fetch upstream --tags --prune
+          tag="${{ inputs.source_tag }}"
+          if [ -z "$tag" ]; then
+            tag=$(git for-each-ref --sort=-creatordate --format='%(refname:short)' 'refs/tags/dsh-v*' | head -n1)
+          fi
+          if [ -z "$tag" ]; then
+            echo 'fork build: no dsh-v* tag found' >&2
+            exit 1
+          fi
+          echo "TAG=$tag" >> "$GITHUB_ENV"
+          git merge --no-edit "$tag"
+
+      - name: Apply dark-icon overlay
+        run: bash .fork/apply-overlay.sh
+
+      - name: Report toolchain
+        run: |
+          actool --version
+          node --version
+
+      - name: Skip an already published tag
+        id: built
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh release view "fork-$TAG" >/dev/null 2>&1; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: pnpm/action-setup@v5.0.0
+        if: steps.built.outputs.exists != 'true'
+
+      - uses: actions/setup-node@v7.0.0
+        if: steps.built.outputs.exists != 'true'
+        with:
+          node-version: '24'
+          cache: pnpm
+
+      - name: Install dependencies
+        if: steps.built.outputs.exists != 'true'
+        run: pnpm install --frozen-lockfile
+
+      - name: Package unsigned DMG
+        if: steps.built.outputs.exists != 'true'
+        run: pnpm run package:desktop:mac:arm64:unsigned
+
+      - name: Upload artifact
+        if: steps.built.outputs.exists != 'true'
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          name: deepseek-harness-${{ env.TAG }}
+          path: apps/desktop/.desktop-build/targets/mac-arm64/unsigned-artifacts/*.dmg
+          if-no-files-found: error
+
+      - name: Publish release
+        if: steps.built.outputs.exists != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "fork-$TAG" \
+            apps/desktop/.desktop-build/targets/mac-arm64/unsigned-artifacts/*.dmg \
+            --title "Fork $TAG" \
+            --notes "Unsigned macOS arm64 build with the Icon Composer artwork (light, dark, tinted). Install by opening the DMG; remove the quarantine attribute if Gatekeeper blocks it."
+
+      - name: Notify
+        if: steps.built.outputs.exists != 'true' && env.NOTIFY_WEBHOOK != ''
+        run: |
+          curl -fsS -X POST "$NOTIFY_WEBHOOK" \
+            -H 'Content-Type: application/json' \
+            -d "{\"text\":\"Fork build $TAG is ready: ${{ github.server_url }}/${{ github.repository }}/releases/tag/fork-$TAG\"}"
